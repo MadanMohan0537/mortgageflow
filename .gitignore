@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# AWS / SAM
+.aws-sam/
+samconfig.toml
+
+# Local data
+*.db
+pgdata/
+.localstack/
+
+# Locust
+locust_report*
