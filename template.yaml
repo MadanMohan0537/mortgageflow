@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: MortgageFlow synthetic AWS demo
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  DocumentBucketName:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'
+    Description: Globally unique name for the private synthetic document bucket
+  IdentitySecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager JSON API identity map
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+Globals:
+  Function:
+    Runtime: python3.12
+    CodeUri: .
+    Timeout: 20
+    MemorySize: 256
+    VpcConfig:
+      SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      SubnetIds: !Ref PrivateSubnets
+    Environment:
+      Variables:
+        DATABASE_SECRET_ARN: !GetAtt Database.MasterUserSecret.SecretArn
+        DATABASE_HOST: !GetAtt Database.Endpoint.Address
+Resources:
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MortgageFlow Lambda outbound access
+      VpcId: !Ref VpcId
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL access from MortgageFlow functions
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+  DatabaseSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private MortgageFlow subnets
+      SubnetIds: !Ref PrivateSubnets
+  DatabaseParameters:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Require PostgreSQL transport encryption
+      Family: postgres17
+      Parameters:
+        rds.force_ssl: '1'
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: postgres
+      EngineVersion: '17.11'
+      DBName: mortgageflow
+      MasterUsername: mortgageflow
+      ManageMasterUserPassword: true
+      DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref DatabaseParameters
+      DBSubnetGroupName: !Ref DatabaseSubnets
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+  Documents:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DocumentBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireSyntheticUploads
+            Status: Enabled
+            ExpirationInDays: 7
+  DocumentsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Documents
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt Documents.Arn, !Sub '${Documents.Arn}/*']
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${Documents.Arn}/applications/*'
+            Condition:
+              'Null':
+                s3:if-none-match: 'true'
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.main.handler
+      Environment:
+        Variables:
+          API_IDENTITIES_SECRET_ARN: !Ref IdentitySecretArn
+          DOCUMENT_BUCKET: !Ref DocumentBucketName
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: [!GetAtt Database.MasterUserSecret.SecretArn, !Ref IdentitySecretArn]
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${DocumentBucketName}/applications/*'
+      Events:
+        Http:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+  FailedEvents:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  DocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: workers.document_worker.handler
+      Environment:
+        Variables:
+          DOCUMENT_BUCKET: !Ref DocumentBucketName
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt FailedEvents.Arn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !GetAtt Database.MasterUserSecret.SecretArn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${DocumentBucketName}/applications/*'
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${DocumentBucketName}'
+      Events:
+        Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref Documents
+            Events: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: applications/
+  MigrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.migrate.handler
+      Timeout: 120
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !GetAtt Database.MasterUserSecret.SecretArn
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApiFunction}'
+      RetentionInDays: 14
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DocumentFunction}'
+      RetentionInDays: 14
+  MigrationLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MigrationFunction}'
+      RetentionInDays: 14
+  FailureTopic:
+    Type: AWS::SNS::Topic
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref FailureTopic]
+  WorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref FailureTopic]
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","width":12,"height":6,"properties":{"region":"${AWS::Region}",
+           "title":"HTTP requests and errors","stat":"Sum","metrics":[
+            ["AWS/ApiGateway","Count","ApiId","${HttpApi}"],
+            [".","4xx",".","."], [".","5xx",".","."]]}},
+          {"type":"metric","width":12,"height":6,"properties":{"region":"${AWS::Region}",
+           "title":"HTTP latency p50 / p95","metrics":[["AWS/ApiGateway","Latency","ApiId","${HttpApi}",{"stat":"p50"}],
+            [".",".",".",".",{"stat":"p95"}]]}},
+          {"type":"metric","width":12,"height":6,"properties":{"region":"${AWS::Region}",
+           "title":"Worker errors, throttles and queued failures","stat":"Sum","metrics":[
+            ["AWS/Lambda","Errors","FunctionName","${DocumentFunction}"],
+            [".","Throttles",".","."],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${FailedEvents.QueueName}",{"stat":"Maximum"}]]}},
+          {"type":"metric","width":12,"height":6,"properties":{"region":"${AWS::Region}",
+           "title":"Worker duration","metrics":[["AWS/Lambda","Duration","FunctionName","${DocumentFunction}",{"stat":"p95"}]]}}
+        ]}
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  MigrationFunctionName:
+    Value: !Ref MigrationFunction
+  DocumentFunctionName:
+    Value: !Ref DocumentFunction
+  DocumentBucket:
+    Value: !Ref Documents
+  FailureQueueUrl:
+    Value: !Ref FailedEvents
+  FailureTopicArn:
+    Value: !Ref FailureTopic
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
