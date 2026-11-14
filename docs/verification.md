@@ -2,11 +2,11 @@
 
 ## Test evidence
 
-The local verification used Python 3.12 and PostgreSQL 18.6. The suite passed **22 tests** with **93.84% statement coverage** across the API and worker. Ruff lint, formatting, and mypy passed. The SAM template passed CloudFormation lint in us-east-1.
+The local verification used Python 3.12 and PostgreSQL 18.6. The suite passed **22 tests** with **93.86% statement coverage** across the API and worker. Ruff lint, formatting, and mypy passed. The SAM template passed CloudFormation lint in us-east-1.
 
 ```text
 22 passed
-Required test coverage of 85% reached. Total coverage: 93.84%
+Required test coverage of 85% reached. Total coverage: 93.86%
 ```
 
 A separate HTTP smoke test used Uvicorn, the same PostgreSQL server, and the Moto S3 emulator. It covered creating a draft, validating the sample (34.67% DTI), submitting, reviewing, uploading with a signed URL, replaying an upload notification twice, receiving one processing audit event, rejecting an unauthenticated read with HTTP 401, and completing review. The AWS stack and the live S3 notification trigger require verification after deployment.
