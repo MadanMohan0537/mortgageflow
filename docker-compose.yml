@@ -1,52 +1,51 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:17
     environment:
       POSTGRES_DB: mortgageflow
       POSTGRES_USER: mortgageflow
-      POSTGRES_PASSWORD: mortgageflow
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mortgageflow -d mortgageflow"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  localstack:
-    image: localstack/localstack:3.8
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - mortgageflow-db:/var/lib/postgresql/data
+  storage:
+    image: localstack/localstack:4.14.0
     environment:
       SERVICES: s3
-      DEFAULT_REGION: us-east-1
+      GATEWAY_LISTEN: 0.0.0.0:4566
     ports:
-      - "4566:4566"
-    volumes:
-      - "./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-s3.sh"
-
+      - "127.0.0.1:4566:4566"
+    networks:
+      default:
+        aliases: [s3.localhost.localstack.cloud]
+    healthcheck:
+      test: ["CMD", "awslocal", "s3", "ls"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
   api:
     build: .
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env.example
-    environment:
-      DATABASE_URL: postgresql+psycopg2://mortgageflow:mortgageflow@db:5432/mortgageflow
-      S3_ENDPOINT_URL: http://localstack:4566
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      S3_BUCKET: mortgageflow-docs-local
-      API_KEY: dev-api-key-change-me
-      APP_ENV: local
     depends_on:
       db:
         condition: service_healthy
-      localstack:
-        condition: service_started
-    command: >
-      sh -c "alembic upgrade head &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
-
+      storage:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      API_IDENTITIES: ${API_IDENTITIES:?Copy .env.example to .env}
+      DEMO_DTI_THRESHOLD: ${DEMO_DTI_THRESHOLD:-43.00}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_URL: postgresql+psycopg://mortgageflow:${POSTGRES_PASSWORD}@db:5432/mortgageflow
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      S3_ENDPOINT_URL: http://s3.localhost.localstack.cloud:4566
+      DOCUMENT_BUCKET: mortgageflow-local
+    command: ["/bin/sh", "-c", "alembic upgrade head && python -m scripts.init_storage && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log"]
 volumes:
-  pgdata:
+  mortgageflow-db:

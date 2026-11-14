@@ -1,121 +1,71 @@
-"""Shared pytest fixtures — in-memory SQLite for fast local tests."""
-
-from __future__ import annotations
-
+import json
 import os
-import uuid
-from collections.abc import Generator
-from decimal import Decimal
+from pathlib import Path
 
-import boto3
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
-from moto import mock_aws
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import text
 
-# Force deterministic test settings before app import
-os.environ.setdefault("API_KEY", "test-api-key")
-os.environ.setdefault("JWT_SECRET", "test-jwt-secret")
-os.environ.setdefault("APP_ENV", "test")
-os.environ.setdefault("S3_BUCKET", "mortgageflow-docs-test")
-os.environ.setdefault("S3_ENDPOINT_URL", "")
-os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
-os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
-os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
-os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
-
-from app.core.config import get_settings
-from app.db.base import Base
-from app.db.session import get_db
+from app.config import engine, identities, secret, threshold
 from app.main import app
-from app.schemas.application import ApplicationCreate
 
-get_settings.cache_clear()
+ALICE = {"Authorization": "Bearer test-applicant-alice-token-0001"}
+BOB = {"Authorization": "Bearer test-applicant-bobby-token-0001"}
+REVIEW = {"Authorization": "Bearer test-reviewer-token-0000000001"}
+EXAMPLE = {
+    "applicant_alias": "synthetic-001",
+    "annual_income": "90000.00",
+    "monthly_debt": "800.00",
+    "housing_payment": "1800.00",
+    "requested_amount": "250000.00",
+}
 
 
-@pytest.fixture()
-def db_engine():
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-        future=True,
+@pytest.fixture(scope="session")
+def migrated(tmp_path_factory):
+    patch = pytest.MonkeyPatch()
+    url = os.getenv("TEST_DATABASE_URL") or f"sqlite:///{tmp_path_factory.mktemp('db') / 'test.db'}"
+    patch.setenv("DATABASE_URL", url)
+    patch.setenv("DEMO_DTI_THRESHOLD", "43.00")
+    patch.setenv("DOCUMENT_BUCKET", "synthetic-test-bucket")
+    patch.setenv(
+        "API_IDENTITIES",
+        json.dumps(
+            {
+                "alice": {"role": "applicant", "token": ALICE["Authorization"].split()[1]},
+                "bob": {"role": "applicant", "token": BOB["Authorization"].split()[1]},
+                "reviewer": {"role": "reviewer", "token": REVIEW["Authorization"].split()[1]},
+            }
+        ),
     )
-
-    @event.listens_for(engine, "connect")
-    def _fk_pragma(dbapi_connection, _connection_record):  # noqa: ANN001
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    Base.metadata.create_all(bind=engine)
-    yield engine
-    Base.metadata.drop_all(bind=engine)
-    engine.dispose()
-
-
-@pytest.fixture()
-def db_session(db_engine) -> Generator[Session, None, None]:
-    TestingSession = sessionmaker(
-        bind=db_engine, autocommit=False, autoflush=False, class_=Session
-    )
-    session = TestingSession()
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     try:
-        yield session
+        command.upgrade(config, "head")
+        command.downgrade(config, "base")
+        command.upgrade(config, "head")
+        command.upgrade(config, "head")
+        yield config
     finally:
-        session.close()
+        command.downgrade(config, "base")
+        engine().dispose()
+        for cached in (engine, identities, secret, threshold):
+            cached.cache_clear()
+        patch.undo()
 
 
-@pytest.fixture()
-def s3_bucket():
-    with mock_aws():
-        client = boto3.client("s3", region_name="us-east-1")
-        client.create_bucket(Bucket="mortgageflow-docs-test")
+@pytest.fixture
+def client(migrated):
+    with engine().begin() as conn:
+        for table in ("audit_events", "documents", "validation_results", "applications"):
+            conn.execute(text(f"DELETE FROM {table}"))
+    with TestClient(app) as client:
         yield client
 
 
-@pytest.fixture()
-def client(db_session, s3_bucket) -> Generator[TestClient, None, None]:
-    def _override_db():
-        try:
-            yield db_session
-        finally:
-            pass
-
-    app.dependency_overrides[get_db] = _override_db
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture()
-def auth_headers() -> dict[str, str]:
-    return {
-        "X-API-Key": "test-api-key",
-        "X-Actor-Id": "test-applicant",
-        "X-Correlation-ID": str(uuid.uuid4()),
-    }
-
-
-@pytest.fixture()
-def sample_payload() -> dict:
-    return {
-        "applicant_alias": "demo-user-001",
-        "annual_income": "90000.00",
-        "monthly_debt": "800.00",
-        "housing_payment": "1800.00",
-        "requested_amount": "250000.00",
-    }
-
-
-@pytest.fixture()
-def sample_create() -> ApplicationCreate:
-    return ApplicationCreate(
-        applicant_alias="demo-user-001",
-        annual_income=Decimal("90000.00"),
-        monthly_debt=Decimal("800.00"),
-        housing_payment=Decimal("1800.00"),
-        requested_amount=Decimal("250000.00"),
-    )
+@pytest.fixture
+def application(client):
+    response = client.post("/v1/applications", headers=ALICE, json=EXAMPLE)
+    assert response.status_code == 201, response.text
+    return f"/v1/applications/{response.json()['id']}"

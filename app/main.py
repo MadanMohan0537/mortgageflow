@@ -1,62 +1,119 @@
-"""MortgageFlow FastAPI application entrypoint."""
+import json
+import logging
+import os
+from time import perf_counter
+from uuid import uuid4
 
-from __future__ import annotations
-
-import uuid
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from mangum import Mangum
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.exceptions import HTTPException
 
-from app.api.v1.router import api_router
-from app.core.config import get_settings
-from app.core.errors import register_exception_handlers
-from app.core.logging import configure_logging, correlation_id_var, get_logger
-from app.schemas.common import HealthResponse
+from app.api import DB, router
 
-configure_logging()
-logger = get_logger(__name__)
-settings = get_settings()
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    logger.info("Starting %s (%s)", settings.app_name, settings.app_env)
-    yield
-    logger.info("Shutting down %s", settings.app_name)
-
-
+logger = logging.getLogger("mortgageflow")
+logger.setLevel(logging.INFO)
+cloud = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
 app = FastAPI(
-    title=settings.app_name,
+    title="MortgageFlow",
     version="1.0.0",
-    description=(
-        "Cloud-based mortgage application processing & validation system. "
-        "Educational simulation only — synthetic data, demo rules, not credit decisions."
-    ),
-    lifespan=lifespan,
+    description="Synthetic mortgage processing and example rules for educational use.",
+    docs_url=None if cloud else "/docs",
+    redoc_url=None if cloud else "/redoc",
+    openapi_url=None if cloud else "/openapi.json",
 )
-register_exception_handlers(app)
+app.include_router(router)
+
+
+def error(request: Request, status: int, message: str, *, fields=None, headers=None):
+    code = {
+        400: "BAD_REQUEST",
+        401: "UNAUTHENTICATED",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        409: "CONFLICT",
+        422: "INVALID_INPUT",
+        500: "INTERNAL_ERROR",
+        503: "SERVICE_UNAVAILABLE",
+    }.get(status, "HTTP_ERROR")
+    return JSONResponse(
+        status_code=status,
+        headers=headers,
+        content={
+            "code": code,
+            "message": message,
+            "correlation_id": request.state.correlation_id,
+            "fields": fields or [],
+        },
+    )
 
 
 @app.middleware("http")
-async def correlation_middleware(request: Request, call_next):
-    header_name = settings.correlation_header
-    correlation_id = request.headers.get(header_name) or str(uuid.uuid4())
-    token = correlation_id_var.set(correlation_id)
+async def trace(request: Request, call_next):
+    request.state.correlation_id = str(uuid4())
+    start = perf_counter()
     try:
-        response: Response = await call_next(request)
-    finally:
-        correlation_id_var.reset(token)
-    response.headers[header_name] = correlation_id
+        response = await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "unexpected_failure correlation_id=%s type=%s",
+            request.state.correlation_id,
+            type(exc).__name__,
+        )
+        response = error(request, 500, "An unexpected error occurred")
+    response.headers["X-Correlation-ID"] = request.state.correlation_id
+    response.headers["Cache-Control"] = "no-store"
+    route = request.scope.get("route")
+    logger.info(
+        json.dumps(
+            {
+                "event": "http_request",
+                "route": getattr(route, "path", "unmatched"),
+                "method": request.method,
+                "status": response.status_code,
+                "correlation_id": request.state.correlation_id,
+                "duration_ms": round((perf_counter() - start) * 1000, 2),
+            }
+        )
+    )
     return response
 
 
-@app.get("/health", response_model=HealthResponse, tags=["health"])
-def health() -> HealthResponse:
-    return HealthResponse(status="ok", app=settings.app_name, env=settings.app_env)
+@app.exception_handler(HTTPException)
+async def http_error(request: Request, exc: HTTPException):
+    return error(request, exc.status_code, str(exc.detail), headers=exc.headers)
 
 
-app.include_router(api_router, prefix=settings.api_prefix)
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    fields = [
+        {"field": ".".join(map(str, item["loc"])), "type": item["type"]} for item in exc.errors()
+    ]
+    return error(request, 422, "Request validation failed", fields=fields)
 
-# AWS Lambda adapter (API Gateway HTTP API / REST)
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error(request: Request, exc: SQLAlchemyError):
+    logger.error(
+        "database_failure correlation_id=%s type=%s",
+        request.state.correlation_id,
+        type(exc).__name__,
+    )
+    return error(request, 503, "Database operation failed")
+
+
+@app.get("/health", tags=["operations"])
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready", tags=["operations"])
+def ready(db: DB):
+    db.execute(text("SELECT 1"))
+    return {"status": "ready"}
+
+
 handler = Mangum(app, lifespan="off")

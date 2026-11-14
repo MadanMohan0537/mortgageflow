@@ -1,186 +1,121 @@
 # MortgageFlow
 
-Cloud-oriented **mortgage application processing & validation** backend (educational simulation).
+MortgageFlow is a FastAPI backend for practicing mortgage application processing with synthetic data. Applicants create and submit records, attach dummy documents, and track progress. Reviewers move records through a simulated workflow. The versioned DTI rule returns example review flags for educational use.
 
-Python/FastAPI handles synchronous APIs; PostgreSQL persists applications, validation results, documents, and audit events; S3 + a Lambda-style worker process synthetic document uploads idempotently.
+## Run locally
 
-> **Not a credit product.** Use synthetic data only. Demo rules (for example `REVIEW_DTI`) are explanatory flags, not lending decisions.
+Prerequisites are Docker with Compose, curl, and jq.
 
-## Stack
+```sh
+cp .env.example .env
+docker compose up --build -d
+curl --fail http://localhost:8000/ready
+```
 
-| Layer | Choice |
-| --- | --- |
-| API | FastAPI + Pydantic v2 |
-| DB | PostgreSQL + SQLAlchemy 2 + Alembic |
-| Auth | Shared API key (`X-API-Key`) + actor header / JWT |
-| Documents | S3 pre-signed PUT + document worker |
-| Local AWS | LocalStack S3 |
-| Deploy (optional) | AWS SAM (`infra/template.yaml`) + Mangum |
-| Quality | PyTest, Ruff, GitHub Actions |
+Open [Swagger UI](http://localhost:8000/docs) to try the API. The PostgreSQL volume persists applications across restarts. Compose also starts a local S3 emulator.
+
+```sh
+BASE=http://localhost:8000
+APPLICANT=demo-applicant-local-token-0001
+REVIEWER=demo-reviewer-local-token-00001
+APP_ID=$(curl -fsS -X POST "$BASE/v1/applications" \
+  -H "Authorization: Bearer $APPLICANT" -H 'Content-Type: application/json' \
+  --data-binary @examples/application.json | jq -er .id)
+APP="$BASE/v1/applications/$APP_ID"
+
+curl -fsS -X POST "$APP/validate" -H "Authorization: Bearer $APPLICANT" | jq
+curl -fsS -X POST "$APP/submit" -H "Authorization: Bearer $APPLICANT" | jq
+curl -fsS -X POST "$APP/review" -H "Authorization: Bearer $REVIEWER" \
+  -H 'Content-Type: application/json' -d '{"status":"IN_REVIEW"}' | jq
+```
+
+The sample validation returns DTI **34.67%**. The default threshold is **43.00%**. A rounded DTI above the threshold gets the `REVIEW_DTI` flag. Required fields are enforced at creation and explicit nulls are rejected on updates. The stored application therefore has all required fields before validation.
+
+### Upload a dummy document
+
+```sh
+SIZE=$(wc -c < examples/dummy.txt | tr -d ' ')
+UPLOAD=$(curl -fsS -X POST "$APP/documents/upload-url" \
+  -H "Authorization: Bearer $APPLICANT" -H 'Content-Type: application/json' \
+  -d "{\"filename\":\"dummy.txt\",\"mime_type\":\"text/plain\",\"size_bytes\":$SIZE}")
+curl -fsS -X PUT "$(jq -er .url <<<"$UPLOAD")" \
+  -H 'Content-Type: text/plain' -H "Content-Length: $SIZE" -H 'If-None-Match: *' \
+  --data-binary @examples/dummy.txt
+docker compose exec api python -m scripts.replay_upload "$(jq -er .document_id <<<"$UPLOAD")"
+curl -fsS "$APP/status" -H "Authorization: Bearer $APPLICANT" | jq
+curl -fsS "$APP/audit" -H "Authorization: Bearer $APPLICANT" | jq
+```
+
+The Compose replay invokes the same handler used by AWS. Replay the notification twice to see that only one processing audit entry appears. The upload URL lasts five minutes and is bound to its content type, length and unique key. Use a fresh URL when the old one expires. Document processing checks the uploaded object's metadata and size.
+
+### Run the scripted demo
+
+With Compose running and the development dependencies installed, run the same sequence with:
+
+```sh
+DEMO_APPLICANT_TOKEN=demo-applicant-local-token-0001 \
+DEMO_REVIEWER_TOKEN=demo-reviewer-local-token-00001 python -m scripts.demo
+```
+
+## API
+
+| Method | Endpoint | Access |
+|---|---|---|
+| POST | `/v1/applications` | Applicant |
+| GET | `/v1/applications?status=DRAFT&limit=25&offset=0` | Owner-scoped applicant or reviewer |
+| GET | `/v1/applications/{id}` | Owner or reviewer |
+| PATCH | `/v1/applications/{id}` | Owner, in draft or needs info |
+| POST | `/v1/applications/{id}/validate` | Owner or reviewer |
+| GET | `/v1/applications/{id}/validations?limit=25&offset=0` | Owner or reviewer, newest first |
+| POST | `/v1/applications/{id}/submit` | Owner |
+| POST | `/v1/applications/{id}/review` | Reviewer |
+| POST | `/v1/applications/{id}/documents/upload-url` | Owner |
+| GET | `/v1/applications/{id}/status` | Owner or reviewer |
+| GET | `/v1/applications/{id}/audit` | Owner or reviewer |
+| GET | `/health`, `/ready` | Operational probes |
+
+Application writes and their audit events commit together. Errors include a machine-readable code, message, correlation ID, and field details where applicable. Applicant access to another applicant's record returns 404. Request and worker logs avoid financial values, document bytes, tokens, and signed URLs.
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md).
-
-```text
-Client → FastAPI → PostgreSQL
-              ↘ S3 pre-signed upload → ObjectCreated → Document worker → PostgreSQL
-Logs/metrics → CloudWatch (cloud)
+```mermaid
+flowchart TD
+    Client --> Gateway["API Gateway"]
+    Gateway --> API["FastAPI on Lambda"]
+    API --> DB[("PostgreSQL")]
+    API -->|Signed PUT URL| Client
+    Client -->|PUT| S3["Private S3 bucket"]
+    S3 -->|ObjectCreated| Worker["Document Lambda"]
+    Worker --> DB
+    Worker --> DLQ["SQS failure queue"]
+    API --> Logs["CloudWatch"]
+    Worker --> Logs
 ```
 
-## Quick start (local)
+```mermaid
+erDiagram
+    APPLICATIONS ||--o{ VALIDATION_RESULTS : records
+    APPLICATIONS ||--o{ DOCUMENTS : tracks
+    APPLICATIONS ||--o{ AUDIT_EVENTS : records
+```
 
-### Prerequisites
+Lambda and Mangum keep the API deployment small and let S3 invoke the worker asynchronously. This introduces cold starts and creates short-lived database connections. RDS provides the same PostgreSQL behavior as the local setup and supports a private TLS endpoint. Local Compose avoids the recurring cost of RDS and VPC connectivity during development.
 
-- Python 3.12+
-- Docker + Docker Compose (for PostgreSQL + LocalStack)
+## Tests and deployment
 
-### 1. Configure
-
-```bash
-cp .env.example .env
-python -m venv .venv
+```sh
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
+ruff check .
+ruff format --check .
+mypy app workers scripts
+python -m pytest --cov=app --cov=workers --cov-report=term-missing
 ```
 
-### 2. Start dependencies + API
+Set `TEST_DATABASE_URL` to an empty, disposable PostgreSQL database to run the migration and integration suite against PostgreSQL. The fixture upgrades, downgrades, and clears the test schema. Without this variable, tests use temporary SQLite with foreign keys enabled.
 
-```bash
-docker compose up --build
-```
+- [AWS setup, monitoring, cost, and teardown](docs/aws.md)
+- [Testing and performance evidence](docs/verification.md)
 
-API: http://localhost:8000  
-OpenAPI: http://localhost:8000/docs  
-Health: `GET /health`
-
-### 3. Or run API on the host
-
-```bash
-docker compose up -d db localstack
-export $(grep -v '^#' .env | xargs)
-alembic upgrade head
-uvicorn app.main:app --reload
-```
-
-### 4. Seed synthetic samples (optional)
-
-```bash
-python scripts/seed_synthetic.py
-```
-
-## API examples
-
-All application routes require `X-API-Key` (see `.env.example`).
-
-```bash
-export API_KEY=dev-api-key-change-me
-
-# Create
-curl -s -X POST http://localhost:8000/v1/applications \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: $API_KEY" \
-  -H "X-Actor-Id: demo-user-001" \
-  -d '{
-    "applicant_alias": "demo-user-001",
-    "annual_income": "90000.00",
-    "monthly_debt": "800.00",
-    "housing_payment": "1800.00",
-    "requested_amount": "250000.00"
-  }'
-
-# Validate (DTI example → 34.67%)
-curl -s -X POST http://localhost:8000/v1/applications/<id>/validate \
-  -H "X-API-Key: $API_KEY"
-
-# Submit
-curl -s -X POST http://localhost:8000/v1/applications/<id>/submit \
-  -H "X-API-Key: $API_KEY"
-
-# Document upload URL (synthetic .txt / .pdf only)
-curl -s -X POST http://localhost:8000/v1/applications/<id>/documents/upload-url \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: $API_KEY" \
-  -d '{"filename":"paystub.txt","mime_type":"text/plain","size_bytes":64}'
-
-# Status
-curl -s http://localhost:8000/v1/applications/<id>/status \
-  -H "X-API-Key: $API_KEY"
-```
-
-### Endpoints
-
-| Method | Route | Behavior |
-| --- | --- | --- |
-| POST | `/v1/applications` | Create → `201`, status `DRAFT` |
-| GET | `/v1/applications` | Paginated list; `?status=` filter |
-| GET | `/v1/applications/{id}` | Read one |
-| PATCH | `/v1/applications/{id}` | Allowlisted edits; `409` on invalid transitions |
-| POST | `/v1/applications/{id}/validate` | Store DTI + demo flags |
-| POST | `/v1/applications/{id}/submit` | `DRAFT` → `SUBMITTED` |
-| POST | `/v1/applications/{id}/documents/upload-url` | Short-lived S3 PUT URL |
-| GET | `/v1/applications/{id}/status` | State + outstanding tasks |
-| POST | `/v1/applications/{id}/review` | Reviewer status updates |
-
-Structured errors return `code`, `message`, `correlation_id`, and optional `details`.
-
-## Tests
-
-```bash
-pytest -q --cov=app --cov-report=term-missing
-```
-
-Coverage includes DTI math, status transitions, 201/401/404/409/422 API cases, unsupported uploads, and duplicate S3 event handling.
-
-## Document worker
-
-```bash
-python -m app.workers.document_worker scripts/sample_s3_event.json
-```
-
-Deduplication uses `documents.upload_event_id` (UNIQUE). Replaying the same S3 notification does not double-process.
-
-## AWS deployment (optional)
-
-1. Enable a budget alert; prefer a dedicated account/project boundary.
-2. Store secrets outside git (Secrets Manager / SSM).
-3. Deploy with SAM:
-
-```bash
-sam build -t infra/template.yaml
-sam deploy --guided
-```
-
-4. Capture evidence: private bucket settings, Lambda logs, CloudWatch error alarm.
-5. **Teardown** idle RDS/Lambda/API Gateway/S3 resources when finished.
-
-See [docs/security-privacy.md](docs/security-privacy.md) and [docs/performance.md](docs/performance.md).
-
-## Repository layout
-
-```text
-app/                 FastAPI app, services, repositories, workers
-migrations/          Alembic history
-tests/               Unit + API/integration tests
-infra/               AWS SAM template
-scripts/             Seed, Locust, LocalStack init, sample events
-docs/                Architecture, security, performance notes
-.github/workflows/   CI (lint + tests)
-```
-
-## Definition of done (guide alignment)
-
-- [x] Documented REST API with OpenAPI at `/docs`
-- [x] PostgreSQL schema + Alembic migration
-- [x] Decimal DTI validation + demo flags / `rules_version`
-- [x] Status workflow + audit events with correlation IDs
-- [x] S3 pre-signed upload + idempotent document worker
-- [x] Automated tests (success, invalid input, auth, conflict, duplicate event)
-- [x] Docker Compose local stack + CI workflow
-- [x] SAM IaC sketch + security/teardown notes
-
-## Known limitations
-
-- Cloud RDS/networking and real IAM least-privilege tuning are left to the deployer’s budget.
-- API key auth is intentionally simple for a portfolio demo; swap for Cognito/JWT gateway auth for production-like setups.
-- No OCR, credit pulls, or real PII handling by design.
+Use synthetic aliases, amounts, and documents only. Demo tokens are plain bearer tokens for local development. Generate unique tokens for a deployed demo and store them in Secrets Manager. The simulated reviewer role has access to all applications. Uploads are checked by extension, declared type and size, with no content inspection.
