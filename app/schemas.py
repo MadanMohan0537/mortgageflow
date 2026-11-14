@@ -1,10 +1,10 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Status(StrEnum):
@@ -88,6 +88,13 @@ class ValidationView(Schema):
     flags: list[dict[str, str]]
     rules_version: str
     checked_at: datetime
+
+    @field_validator("checked_at")
+    @classmethod
+    def normalize_checked_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class UploadInput(Schema):

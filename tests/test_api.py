@@ -104,3 +104,32 @@ def test_failed_audit_rolls_back(client):
     with Session(engine()) as db:
         assert db.scalar(select(func.count()).select_from(Application)) == 0
         assert db.scalar(select(func.count()).select_from(AuditEvent)) == 0
+
+
+def test_validation_history_is_read_only_and_owner_scoped(client, application):
+    history = f"{application}/validations"
+    assert client.get(history, headers=ALICE).json() == []
+    assert client.get(history, headers=BOB).status_code == 404
+
+    first = client.post(f"{application}/validate", headers=ALICE).json()
+    client.patch(application, headers=ALICE, json={"monthly_debt": "2000.00"}).raise_for_status()
+    second = client.post(f"{application}/validate", headers=ALICE).json()
+
+    assert client.get(history, headers=REVIEW).json() == [second, first]
+    assert client.get(f"{history}?limit=1&offset=1", headers=ALICE).json() == [first]
+    assert client.get(f"{history}?limit=101", headers=ALICE).status_code == 422
+    audit = client.get(f"{application}/audit", headers=ALICE).json()
+    assert sum(event["action"] == "VALIDATION_RECORDED" for event in audit) == 2
+
+
+def test_foreign_key_rejects_orphan_audit_event(client):
+    from sqlalchemy.exc import IntegrityError
+
+    with Session(engine()) as db:
+        db.add(
+            AuditEvent(
+                application_id=uuid4(), actor_id="test", action="TEST", correlation_id=str(uuid4())
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.flush()

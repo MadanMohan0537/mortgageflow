@@ -66,6 +66,7 @@ DEMO_REVIEWER_TOKEN=demo-reviewer-local-token-00001 python -m scripts.demo
 | GET | `/v1/applications/{id}` | Owner or reviewer |
 | PATCH | `/v1/applications/{id}` | Owner, in draft or needs info |
 | POST | `/v1/applications/{id}/validate` | Owner or reviewer |
+| GET | `/v1/applications/{id}/validations?limit=25&offset=0` | Owner or reviewer, newest first |
 | POST | `/v1/applications/{id}/submit` | Owner |
 | POST | `/v1/applications/{id}/review` | Reviewer |
 | POST | `/v1/applications/{id}/documents/upload-url` | Owner |

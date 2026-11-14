@@ -27,3 +27,14 @@ With the local API running and a synthetic dataset loaded, repeat the workload w
 BENCHMARK_TOKEN=demo-applicant-local-token-0001 python -m scripts.benchmark \
   --requests 300 --workers 8
 ```
+
+## Seed a repeatable local dataset
+
+With the demo API running and development dependencies installed, use the authenticated
+API to create 200 synthetic drafts and their audit events:
+
+```sh
+DEMO_APPLICANT_TOKEN=demo-applicant-local-token-0001 python -m scripts.seed_synthetic --count 200
+```
+
+Use a fresh demo database for comparable runs. Each invocation creates additional drafts.

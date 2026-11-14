@@ -4,7 +4,7 @@ import re
 from decimal import Decimal
 from functools import cache
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import URL, Engine
 from sqlalchemy.pool import NullPool
 
@@ -36,7 +36,18 @@ def engine() -> Engine:
             query={"sslmode": "verify-full", "sslrootcert": "/var/task/global-bundle.pem"},
         )
         return create_engine(url, poolclass=NullPool)
-    return create_engine(secret("DATABASE_URL"), pool_pre_ping=True)
+    local_engine = create_engine(secret("DATABASE_URL"), pool_pre_ping=True)
+    if local_engine.dialect.name == "sqlite":
+        event.listen(local_engine, "connect", enable_sqlite_foreign_keys)
+    return local_engine
+
+
+def enable_sqlite_foreign_keys(connection, _record) -> None:
+    cursor = connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
 
 
 @cache

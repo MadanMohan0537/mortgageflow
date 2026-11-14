@@ -118,6 +118,24 @@ def validate_application(app_id: UUID, request: Request, actor: User, db: DB):
     return result
 
 
+@router.get("/{app_id}/validations", response_model=list[ValidationView])
+def validation_history(
+    app_id: UUID,
+    actor: User,
+    db: DB,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0, le=100000)] = 0,
+):
+    load(db, app_id, actor)
+    return db.scalars(
+        select(Validation)
+        .where(Validation.application_id == app_id)
+        .order_by(Validation.checked_at.desc(), Validation.id.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+
+
 @router.post("/{app_id}/submit", response_model=ApplicationView)
 def submit_application(app_id: UUID, request: Request, actor: User, db: DB):
     actor.require("applicant")
